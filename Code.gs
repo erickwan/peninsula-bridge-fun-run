@@ -29,6 +29,27 @@ var CONFIG = {
   maxRunnersPerSubmission: 20,
   closedMessage: 'Registration is now closed. Feel free to show up on the day of \u2014 there will be a ' +
     'limited number of bibs with timers for unregistered runners, first come, first served.',
+  // T-shirt pickup announcement (sent only to contacts whose group has
+  // at least one free race tee). Blank-line-separated paragraphs; in
+  // the HTML version, paragraphs starting with the shoe emoji or
+  // ending with ":" render bold.
+  shirtEmailSubject: 'Fun Run Race T-Shirt Announcement & Pick Up',
+  shirtEmailBody:
+    'Congratulations!\n\n' +
+    'If you are receiving this email, you were one of the first 100 to register for the ' +
+    '14th Annual Peninsula Bridge Fun Run — and you\'ll receive the commemorative race ' +
+    'T-shirt designed by Menlo Student: Tali Kauffman and Yuna Lee\n\n' +
+    'T-Shirt Pick-Up Instructions:\n\n' +
+    '👟 Friday, October 2\n\n' +
+    'Students and Menlo faculty/staff can pick up shirts and race bibs (for themselves and ' +
+    'family members) during lunch hours outside the Commons or after school in the loop.\n\n' +
+    '👟 Race Morning\n\n' +
+    'Pick-up will also be available before the race, but please allow extra time as lines ' +
+    'can get long. The race starts promptly at 9:00 a.m.\n\n' +
+    'Keep an eye out for an email this Saturday with important race details and reminders.\n\n' +
+    'If you have any questions, please feel free to reach out — and thank you again for ' +
+    'supporting Peninsula Bridge!\n\n' +
+    'The Fun Run Team',
   organizersText: 'Janice Chan (janice.chan@gmail.com) or Kavya (kavyashree.ks@gmail.com)',
   organizersHtml: '<a href="mailto:janice.chan@gmail.com" style="color:#C93A14">Janice Chan</a> ' +
                   'or <a href="mailto:kavyashree.ks@gmail.com" style="color:#C93A14">Kavya</a>',
@@ -502,12 +523,12 @@ function sendTestEmail() {
 // One entry per unique contact email (case-insensitive), in first-seen
 // order, with all of that contact's runners from the sheet. Each group
 // carries its sheet row numbers plus alreadySent: true when every one
-// of its rows has a "Reminder Sent At" stamp — a group with any
+// of its rows has a stamp in the sentHeader column — a group with any
 // unstamped row (e.g. runners added after the last send) is due again,
 // and a send re-stamps all of its rows.
-function reminderGroups_() {
+function contactGroups_(sentHeader) {
   var sheet = registrationsSheet_();
-  ensureHeader_(sheet);  // makes the "Reminder Sent At" column exist/visible
+  ensureHeader_(sheet);  // makes the tracking columns exist/visible
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
   var iFirst = HEADERS.indexOf('First Name');
@@ -516,7 +537,7 @@ function reminderGroups_() {
   var iShirt = HEADERS.indexOf('T-Shirt Size');
   var iName = HEADERS.indexOf('Contact Name');
   var iEmail = HEADERS.indexOf('Contact Email');
-  var iSent = HEADERS.indexOf('Reminder Sent At');
+  var iSent = HEADERS.indexOf(sentHeader);
   var groups = {};
   var order = [];
   sheet.getRange(2, 1, lastRow - 1, HEADERS.length).getValues().forEach(function (row, i) {
@@ -620,10 +641,61 @@ function sendReminderEmail_(group) {
   });
 }
 
+// Shared machinery for a stamped bulk send: emails each pending group
+// via sendOne, stamps sentHeader on all of that contact's rows after a
+// successful send, skips already-stamped contacts, and refuses to
+// start if the remaining MailApp quota can't cover the pending sends.
+// Avoid deleting sheet rows while a send is running (the stamps are
+// written by row number).
+function sendStampedBatch_(groups, sentHeader, sendOne, label, clearFnName) {
+  if (!groups.length) return 'No eligible contacts found — nothing to send.';
+  var pending = groups.filter(function (g) { return !g.alreadySent; });
+  if (!pending.length) {
+    return 'All ' + groups.length + ' eligible contact(s) are already stamped as sent — nothing to do. ' +
+      'Run ' + clearFnName + '() first to start a new round.';
+  }
+  var quota = MailApp.getRemainingDailyQuota();
+  if (pending.length > quota) {
+    throw new Error('Not sending: ' + pending.length + ' ' + label + '(s) needed but only ' + quota +
+      ' emails left in today’s MailApp quota. Try again tomorrow — already-sent contacts are skipped.');
+  }
+  var sheet = registrationsSheet_();
+  var sentCol = HEADERS.indexOf(sentHeader) + 1;
+  var sent = 0;
+  var failed = [];
+  pending.forEach(function (g) {
+    try {
+      sendOne(g);
+      var now = new Date();
+      g.rows.forEach(function (r) { sheet.getRange(r, sentCol).setValue(now); });
+      sent++;
+    } catch (err) {
+      failed.push(g.email + ' (' + err + ')');
+    }
+    Utilities.sleep(200);  // gentle pacing between sends
+  });
+  var summary = 'Sent ' + sent + ' of ' + pending.length + ' pending ' + label + '(s) (' +
+    (groups.length - pending.length) + ' contact(s) skipped as already sent).' +
+    (failed.length ? ' Failed: ' + failed.join('; ') : '');
+  Logger.log(summary);
+  return summary;
+}
+
+function clearStampColumn_(sentHeader) {
+  var sheet = registrationsSheet_();
+  ensureHeader_(sheet);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 'No registration rows.';
+  sheet.getRange(2, HEADERS.indexOf(sentHeader) + 1, lastRow - 1, 1).clearContent();
+  var summary = 'Cleared "' + sentHeader + '" stamps on ' + (lastRow - 1) + ' row(s).';
+  Logger.log(summary);
+  return summary;
+}
+
 // Dry run: logs every reminder that WOULD go out (and which contacts
 // are already stamped as sent), sends nothing.
 function previewReminderEmails() {
-  var groups = reminderGroups_();
+  var groups = contactGroups_('Reminder Sent At');
   var pending = 0;
   groups.forEach(function (g, i) {
     var status = g.alreadySent ? ' [already sent — will be skipped]'
@@ -641,59 +713,17 @@ function previewReminderEmails() {
   return summary;
 }
 
-// The real send: one email per group contact, in sheet order. Each
-// successful send stamps "Reminder Sent At" on all of that contact's
-// rows, and already-stamped contacts are skipped — so re-running after
-// a partial failure (or tomorrow, if the quota ran out) only covers
-// the misses. Avoid deleting sheet rows while a send is running (the
-// stamps are written by row number).
+// The real send: one reminder per group contact, in sheet order,
+// resumable via the "Reminder Sent At" stamps.
 function sendReminderEmails() {
-  var groups = reminderGroups_();
-  if (!groups.length) return 'No registrations found — nothing to send.';
-  var pending = groups.filter(function (g) { return !g.alreadySent; });
-  if (!pending.length) {
-    return 'All ' + groups.length + ' contact(s) are already stamped as sent — nothing to do. ' +
-      'Run clearReminderTracking() first to start a new reminder round.';
-  }
-  var quota = MailApp.getRemainingDailyQuota();
-  if (pending.length > quota) {
-    throw new Error('Not sending: ' + pending.length + ' reminders needed but only ' + quota +
-      ' emails left in today’s MailApp quota. Try again tomorrow — already-sent contacts are skipped.');
-  }
-  var sheet = registrationsSheet_();
-  var sentCol = HEADERS.indexOf('Reminder Sent At') + 1;
-  var sent = 0;
-  var failed = [];
-  pending.forEach(function (g) {
-    try {
-      sendReminderEmail_(g);
-      var now = new Date();
-      g.rows.forEach(function (r) { sheet.getRange(r, sentCol).setValue(now); });
-      sent++;
-    } catch (err) {
-      failed.push(g.email + ' (' + err + ')');
-    }
-    Utilities.sleep(200);  // gentle pacing between sends
-  });
-  var summary = 'Sent ' + sent + ' of ' + pending.length + ' pending reminder(s) (' +
-    (groups.length - pending.length) + ' contact(s) skipped as already sent).' +
-    (failed.length ? ' Failed: ' + failed.join('; ') : '');
-  Logger.log(summary);
-  return summary;
+  return sendStampedBatch_(contactGroups_('Reminder Sent At'), 'Reminder Sent At',
+    sendReminderEmail_, 'reminder', 'clearReminderTracking');
 }
 
 // Clears every "Reminder Sent At" stamp so the next sendReminderEmails()
 // starts a fresh round and emails everyone again.
 function clearReminderTracking() {
-  var sheet = registrationsSheet_();
-  ensureHeader_(sheet);
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return 'No registration rows.';
-  var sentCol = HEADERS.indexOf('Reminder Sent At') + 1;
-  sheet.getRange(2, sentCol, lastRow - 1, 1).clearContent();
-  var summary = 'Cleared reminder stamps on ' + (lastRow - 1) + ' row(s).';
-  Logger.log(summary);
-  return summary;
+  return clearStampColumn_('Reminder Sent At');
 }
 
 // Sends one sample reminder (with the donate button) to the script
@@ -711,9 +741,97 @@ function sendTestReminderEmail() {
   });
 }
 
+/* ===================== T-shirt pickup emails =====================
+ * "Fun Run Race T-Shirt Announcement & Pick Up" — sent ONLY to group
+ * contacts whose registration includes at least one free race tee
+ * (a non-empty T-Shirt Size in the sheet; PB families and runners
+ * past the first 100 never have one). The subject and body live in
+ * CONFIG.shirtEmailSubject / CONFIG.shirtEmailBody.
+ *
+ * Same workflow and safeguards as the reminder emails:
+ *   previewShirtPickupEmails() — dry run, logs recipients.
+ *   sendTestShirtPickupEmail() — one sample to your own inbox.
+ *   sendShirtPickupEmails()    — the real send; stamps "Shirt Email
+ *     Sent At" on the contact's rows, skips stamped contacts on
+ *     re-runs, refuses to start past the MailApp quota.
+ *   clearShirtPickupTracking() — blanks the column for a new round.
+ * ================================================================ */
+
+function shirtGroups_() {
+  return contactGroups_('Shirt Email Sent At').filter(function (g) {
+    return g.participants.some(function (p) { return p.finalShirtSize; });
+  });
+}
+
+function sendShirtPickupEmail_(group) {
+  var htmlParagraphs = CONFIG.shirtEmailBody.split(/\n\s*\n/).map(function (para) {
+    var bold = para.charAt(0) === '\uD83D' || /:$/.test(para.trim());
+    return '<p style="margin:0 0 14px' + (bold ? ';font-weight:bold' : '') + '">' +
+      escapeHtml_(para).replace(/\n/g, '<br>') + '</p>';
+  }).join('');
+
+  var htmlBody =
+    '<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#172A4D">' +
+      '<div style="background:#F04E23;color:#ffffff;padding:20px 24px;border-radius:10px 10px 0 0">' +
+        '<div style="font-size:21px;font-weight:bold">' + escapeHtml_(CONFIG.eventTitle) + '</div>' +
+        '<div style="font-size:14px;opacity:0.92">Race T-shirt pick-up</div>' +
+      '</div>' +
+      '<div style="border:1px solid #D8E0EC;border-top:none;padding:24px;border-radius:0 0 10px 10px">' +
+        htmlParagraphs +
+      '</div>' +
+    '</div>';
+
+  MailApp.sendEmail({
+    to: group.email,
+    replyTo: CONFIG.organizersReplyTo,
+    name: CONFIG.eventTitle,
+    subject: CONFIG.shirtEmailSubject,
+    body: CONFIG.shirtEmailBody,
+    htmlBody: htmlBody
+  });
+}
+
+// Dry run: logs every shirt-pickup email that WOULD go out, sends nothing.
+function previewShirtPickupEmails() {
+  var groups = shirtGroups_();
+  var pending = 0;
+  groups.forEach(function (g, i) {
+    var shirts = g.participants.filter(function (p) { return p.finalShirtSize; }).length;
+    if (!g.alreadySent) pending++;
+    Logger.log('%s. %s <%s> — %s free tee(s)%s', String(i + 1), g.name, g.email,
+      String(shirts), g.alreadySent ? ' [already sent — will be skipped]' : '');
+  });
+  var summary = pending + ' of ' + groups.length + ' shirt contact(s) would be emailed (' +
+    (groups.length - pending) + ' already sent). Remaining daily mail quota: ' +
+    MailApp.getRemainingDailyQuota() + '.';
+  Logger.log(summary);
+  return summary;
+}
+
+// The real send: one pickup email per contact with at least one free
+// tee, resumable via the "Shirt Email Sent At" stamps.
+function sendShirtPickupEmails() {
+  return sendStampedBatch_(shirtGroups_(), 'Shirt Email Sent At',
+    sendShirtPickupEmail_, 'shirt pickup email', 'clearShirtPickupTracking');
+}
+
+// Clears every "Shirt Email Sent At" stamp so the next
+// sendShirtPickupEmails() emails every shirt contact again.
+function clearShirtPickupTracking() {
+  return clearStampColumn_('Shirt Email Sent At');
+}
+
+// Sends one sample pickup email to the script owner.
+function sendTestShirtPickupEmail() {
+  sendShirtPickupEmail_({
+    name: 'Test Contact',
+    email: Session.getActiveUser().getEmail()
+  });
+}
+
 var HEADERS = ['Bib #', 'First Name', 'Last Name', "Mother's Maiden Name", 'Category',
                'T-Shirt Size', 'Contact Name', 'Contact Email', 'Contact Phone', 'Registered At',
-               'Reminder Sent At'];
+               'Reminder Sent At', 'Shirt Email Sent At'];
 
 // Category recorded for registrations made through the ?pb=1 form
 // variant (Peninsula Bridge families: surname fields, no shirt picker,
