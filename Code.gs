@@ -641,12 +641,17 @@ function sendReminderEmail_(group) {
   });
 }
 
-// Shared machinery for a stamped bulk send: emails each pending group
-// via sendOne, stamps sentHeader on all of that contact's rows after a
-// successful send, skips already-stamped contacts, and refuses to
-// start if the remaining MailApp quota can't cover the pending sends.
-// Avoid deleting sheet rows while a send is running (the stamps are
-// written by row number).
+// At most this many emails go out per invocation of a bulk send. The
+// sent-at stamps make re-runs resume where the last run stopped, so a
+// larger campaign is just "run it again until it reports 0 pending".
+var MAX_EMAILS_PER_RUN = 100;
+
+// Shared machinery for a stamped bulk send: emails pending groups via
+// sendOne — at most MAX_EMAILS_PER_RUN per run, and never more than
+// today's remaining MailApp quota — stamps sentHeader on all of a
+// contact's rows after a successful send, and skips already-stamped
+// contacts. Avoid deleting sheet rows while a send is running (the
+// stamps are written by row number).
 function sendStampedBatch_(groups, sentHeader, sendOne, label, clearFnName) {
   if (!groups.length) return 'No eligible contacts found — nothing to send.';
   var pending = groups.filter(function (g) { return !g.alreadySent; });
@@ -655,15 +660,16 @@ function sendStampedBatch_(groups, sentHeader, sendOne, label, clearFnName) {
       'Run ' + clearFnName + '() first to start a new round.';
   }
   var quota = MailApp.getRemainingDailyQuota();
-  if (pending.length > quota) {
-    throw new Error('Not sending: ' + pending.length + ' ' + label + '(s) needed but only ' + quota +
-      ' emails left in today’s MailApp quota. Try again tomorrow — already-sent contacts are skipped.');
+  if (quota < 1) {
+    return 'Not sending: no emails left in today’s MailApp quota. ' + pending.length +
+      ' ' + label + '(s) still pending — run again tomorrow; already-sent contacts are skipped.';
   }
+  var batch = pending.slice(0, Math.min(MAX_EMAILS_PER_RUN, quota));
   var sheet = registrationsSheet_();
   var sentCol = HEADERS.indexOf(sentHeader) + 1;
   var sent = 0;
   var failed = [];
-  pending.forEach(function (g) {
+  batch.forEach(function (g) {
     try {
       sendOne(g);
       var now = new Date();
@@ -674,8 +680,11 @@ function sendStampedBatch_(groups, sentHeader, sendOne, label, clearFnName) {
     }
     Utilities.sleep(200);  // gentle pacing between sends
   });
-  var summary = 'Sent ' + sent + ' of ' + pending.length + ' pending ' + label + '(s) (' +
-    (groups.length - pending.length) + ' contact(s) skipped as already sent).' +
+  var remaining = pending.length - batch.length + failed.length;
+  var summary = 'Sent ' + sent + ' of ' + batch.length + ' in this run (' +
+    (groups.length - pending.length) + ' contact(s) skipped as already sent' +
+    (batch.length < pending.length ? '; capped at ' + batch.length + ' per run' : '') + ').' +
+    (remaining ? ' ' + remaining + ' ' + label + '(s) still pending — run again to continue.' : ' All done.') +
     (failed.length ? ' Failed: ' + failed.join('; ') : '');
   Logger.log(summary);
   return summary;
